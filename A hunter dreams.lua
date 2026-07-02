@@ -118,36 +118,58 @@ hint.TextScaled = true
 hint.Font = Enum.Font.Gotham
 hint.Parent = frame
 
-print("GUI создан")
+print("✅ GUI создан")
 
 local autoFarmEnabled = false
 local espEnabled = false
 
--- ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
-local function getPosition(obj)
+-- ==================== БЕЗОПАСНЫЕ ФУНКЦИИ ====================
+local function getSafePosition(obj)
     if not obj then return nil end
+    
+    -- Пробуем разные способы получить позицию
     if obj:IsA("BasePart") then
         return obj.Position
     elseif obj:IsA("Model") then
-        if obj.PrimaryPart then return obj.PrimaryPart.Position end
-        local ok, pivot = pcall(function() return obj:GetPivot().Position end)
-        if ok then return pivot end
+        if obj.PrimaryPart then
+            return obj.PrimaryPart.Position
+        end
+        local hrp = obj:FindFirstChild("HumanoidRootPart")
+        if hrp and hrp:IsA("BasePart") then
+            return hrp.Position
+        end
+        local torso = obj:FindFirstChild("Torso") or obj:FindFirstChild("UpperTorso")
+        if torso and torso:IsA("BasePart") then
+            return torso.Position
+        end
     end
+    
     return nil
 end
 
-local function teleportTo(pos)
+local function teleportToSafe(pos)
+    if not pos then return false end
+    
     local char = Player.Character
     if not char then return false end
+    
     local hrp = char:FindFirstChild("HumanoidRootPart")
     if not hrp then return false end
     
-    -- Не даём провалиться под карту
-    local safePos = Vector3.new(pos.X, math.max(pos.Y, 1), pos.Z)
-    pcall(function()
+    -- Защита от провала под карту
+    local safeY = math.max(pos.Y, 1)
+    local safePos = Vector3.new(pos.X, safeY, pos.Z)
+    
+    local success, err = pcall(function()
         hrp.CFrame = CFrame.new(safePos)
     end)
-    return true
+    
+    if success then
+        return true
+    else
+        warn("⚠️ Ошибка телепорта:", err)
+        return false
+    end
 end
 
 -- ==================== ПОЛУЧЕНИЕ КВЕСТА ====================
@@ -277,120 +299,95 @@ local function clickCancelQuest()
     return false
 end
 
--- ==================== УЛУЧШЕННЫЙ ПОИСК МОБОВ ====================
+-- ==================== ПОИСК МОБОВ ====================
 local function findMobs(mobType)
     local mobs = {}
     mobType = mobType:lower()
     
-    print("🔍 Ищу мобов типа: " .. mobType)
-    
-    -- Ищем ВСЕ модели в Workspace
     for _, obj in pairs(Workspace:GetDescendants()) do
         if obj:IsA("Model") and obj ~= Player.Character then
             local name = obj.Name:lower()
             
-            -- Проверяем имя
             if name == mobType or string.find(name, mobType, 1, true) then
-                -- Ищем Humanoid любым способом
-                local hum = nil
+                local hum = obj:FindFirstChildOfClass("Humanoid")
+                if not hum then hum = obj:FindFirstChild("Humanoid") end
                 
-                -- Способ 1: FindFirstChildOfClass
-                hum = obj:FindFirstChildOfClass("Humanoid")
-                
-                -- Способ 2: FindFirstChild (если Humanoid называется иначе)
-                if not hum then
-                    hum = obj:FindFirstChild("Humanoid")
-                end
-                
-                -- Способ 3: ищем среди потомков
-                if not hum then
-                    hum = obj:FindFirstChildWhichIsA("Humanoid")
-                end
-                
-                if hum then
-                    -- Проверяем что живой
-                    if hum.Health and hum.Health > 0 then
+                if hum and hum.Health and hum.Health > 0 then
+                    -- Проверяем что можем получить позицию
+                    local pos = getSafePosition(obj)
+                    if pos then
                         table.insert(mobs, obj)
-                        print("✅ Нашёл: " .. obj.Name .. " (HP: " .. hum.Health .. ")")
                     end
-                else
-                    print("⚠️ Модель " .. obj.Name .. " без Humanoid")
                 end
             end
         end
     end
     
-    print("📊 Всего найдено " .. mobType .. ": " .. #mobs)
     return mobs
 end
 
--- ==================== СТАБИЛЬНЫЙ ПОЛЁТ ====================
-local function flyTo(targetPos, hrp, speed)
-    speed = speed or 80
-    local currentPos = hrp.Position
-    local direction = (targetPos - currentPos)
-    local distance = direction.Magnitude
-    
-    if distance < 0.5 then
-        hrp.CFrame = CFrame.new(currentPos, currentPos + Vector3.new(0, 0, -1))
-        return true
-    end
-    
-    local step = math.min(distance, speed * 0.016)
-    local newPos = currentPos + direction.Unit * step
-    
-    -- НЕ ДАЁМ УЙТИ ПОД КАРТУ
-    newPos = Vector3.new(newPos.X, math.max(newPos.Y, 0.5), newPos.Z)
-    
-    hrp.CFrame = CFrame.new(newPos, targetPos)
-    return false
-end
+-- ==================== ТЕЛЕПОРТ + ПЛАВНЫЙ ПОЛЁТ ====================
+local currentFlightTarget = nil
+local lastTeleportTime = 0
 
--- ==================== АТАКА С УМЕНЬШЕННЫМ РАССТОЯНИЕМ ====================
-local function attackWithStableFlight(mob, offsetBelow)
-    if not mob or not mob.Parent then return false, nil end
+-- Мгновенный телепорт к цели
+local function teleportToMob(mob, offsetBelow)
+    if not mob then return false end
     
-    -- Проверяем Humanoid
-    local hum = mob:FindFirstChildOfClass("Humanoid")
-    if not hum then hum = mob:FindFirstChild("Humanoid") end
-    if not hum or hum.Health <= 0 then return false, nil end
+    local mobPos = getSafePosition(mob)
+    if not mobPos then return false end
     
-    local char = Player.Character
-    if not char then return false, nil end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return false, nil end
+    -- Позиция под мобом
+    local targetPos = Vector3.new(mobPos.X, mobPos.Y - offsetBelow, mobPos.Z)
+    targetPos = Vector3.new(targetPos.X, math.max(targetPos.Y, 1), targetPos.Z)
     
-    -- Находим часть моба
-    local mobPart = mob:FindFirstChild("HumanoidRootPart") or mob:FindFirstChild("Torso") or mob:FindFirstChild("UpperTorso")
-    if not mobPart then
-        for _, part in pairs(mob:GetDescendants()) do
-            if part:IsA("BasePart") then
-                mobPart = part
-                break
+    -- ТЕЛЕПОРТИРУЕМСЯ
+    local success = teleportToSafe(targetPos)
+    
+    if success then
+        -- Поворачиваемся к мобу
+        local char = Player.Character
+        if char then
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                hrp.CFrame = CFrame.new(hrp.Position, mobPos)
             end
         end
     end
-    if not mobPart then return false, nil end
     
-    -- Позиция ПОД мобом (УМЕНЬШЕНО с 2 до 0.5)
-    local targetPos = mobPart.Position - Vector3.new(0, offsetBelow, 0)
+    return success
+end
+
+-- Плавная корректировка позиции (для полёта рядом с мобом)
+local function adjustPosition(mob, offsetBelow)
+    if not mob then return end
     
-    -- Защита от провала под карту
+    local mobPos = getSafePosition(mob)
+    if not mobPos then return end
+    
+    local char = Player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    
+    local targetPos = Vector3.new(mobPos.X, mobPos.Y - offsetBelow, mobPos.Z)
     targetPos = Vector3.new(targetPos.X, math.max(targetPos.Y, 1), targetPos.Z)
     
-    -- Плавный полёт
-    local arrived = flyTo(targetPos, hrp, 100)
+    local currentPos = hrp.Position
+    local distance = (targetPos - currentPos).Magnitude
     
-    -- Бьём если близко
-    local dist = (hrp.Position - mobPart.Position).Magnitude
-    if dist < 10 then
-        local tool = char:FindFirstChildOfClass("Tool")
-        if tool then
-            pcall(function() tool:Activate() end)
-        end
+    -- Если далеко - телепорт, если близко - плавное движение
+    if distance > 15 then
+        -- Слишком далеко - телепорт
+        teleportToMob(mob, offsetBelow)
+    elseif distance > 0.5 then
+        -- Близко - плавное движение
+        local direction = (targetPos - currentPos).Unit
+        local speed = 50 -- Скорость полёта
+        local newPos = currentPos + direction * math.min(distance, speed * 0.016)
+        
+        hrp.CFrame = CFrame.new(newPos, mobPos)
     end
-    
-    return true, dist
 end
 
 -- ==================== ПРОГРЕСС ====================
@@ -405,16 +402,30 @@ local function getQuestProgress()
     return 0
 end
 
+-- ==================== АТАКА ====================
+local function attackMob(mob)
+    if not mob then return end
+    
+    local char = Player.Character
+    if not char then return end
+    
+    local tool = char:FindFirstChildOfClass("Tool")
+    if tool then
+        pcall(function() tool:Activate() end)
+    end
+end
+
 -- ==================== ФАРМ HUNT ====================
 local function farmHuntQuest(questData)
     local mobType = questData.mob
     local targetCount = questData.count
-    local offsetBelow = 0.5 -- УМЕНЬШЕНО с 2 до 0.5 чтобы не проваливаться!
+    local offsetBelow = 0.5
     
     statusLabel.Text = "Фарм: Hunt " .. targetCount .. " " .. mobType
     questInfo.Text = "Квест: " .. questData.rawText
     
     local currentTarget = nil
+    local lastTargetCheck = 0
     
     while autoFarmEnabled do
         task.wait(0.016)
@@ -427,55 +438,57 @@ local function farmHuntQuest(questData)
             return true
         end
         
-        -- Проверяем цель
-        if not currentTarget or not currentTarget.Parent then
-            currentTarget = nil
-        else
-            local hum = currentTarget:FindFirstChildOfClass("Humanoid")
-            if not hum then hum = currentTarget:FindFirstChild("Humanoid") end
-            if not hum or hum.Health <= 0 then
+        -- Проверяем текущую цель
+        if currentTarget then
+            if not currentTarget.Parent then
                 currentTarget = nil
-            end
-        end
-        
-        -- Ищем новую цель
-        if not currentTarget then
-            local mobs = findMobs(mobType)
-            if #mobs == 0 then
-                statusLabel.Text = "Поиск: " .. mobType
-                task.wait(0.5)
-                continue
-            end
-            
-            local char = Player.Character
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            
-            table.sort(mobs, function(a, b)
-                local posA = getPosition(a)
-                local posB = getPosition(b)
-                if not posA or not posB or not hrp then return false end
-                return (posA - hrp.Position).Magnitude < (posB - hrp.Position).Magnitude
-            end)
-            
-            currentTarget = mobs[1]
-            statusLabel.Text = "Лечу к: " .. mobType
-            
-            -- Телепорт если далеко
-            local char = Player.Character
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            local mobPos = getPosition(currentTarget)
-            if hrp and mobPos then
-                local dist = (hrp.Position - mobPos).Magnitude
-                if dist > 30 then -- УМЕНЬШЕНО с 50 до 30
-                    teleportTo(mobPos - Vector3.new(0, offsetBelow, 0))
+            else
+                local hum = currentTarget:FindFirstChildOfClass("Humanoid")
+                if not hum then hum = currentTarget:FindFirstChild("Humanoid") end
+                if not hum or hum.Health <= 0 then
+                    currentTarget = nil
                 end
             end
         end
         
-        -- Атака
+        -- Ищем новую цель если нужно
+        if not currentTarget then
+            local mobs = findMobs(mobType)
+            if #mobs == 0 then
+                statusLabel.Text = "Поиск: " .. mobType
+                task.wait(0.3)
+                continue
+            end
+            
+            -- Сортируем по расстоянию
+            local char = Player.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            local myPos = hrp and getSafePosition(char)
+            
+            table.sort(mobs, function(a, b)
+                local posA = getSafePosition(a)
+                local posB = getSafePosition(b)
+                if not posA or not posB or not myPos then return false end
+                return (posA - myPos).Magnitude < (posB - myPos).Magnitude
+            end)
+            
+            currentTarget = mobs[1]
+            statusLabel.Text = "ТЕЛЕПОРТ к: " .. mobType
+            
+            -- МГНОВЕННЫЙ ТЕЛЕПОРТ к новой цели
+            teleportToMob(currentTarget, offsetBelow)
+        end
+        
+        -- ПЛАВНЫЙ ПОЛЁТ и атака
         if currentTarget then
-            local success, dist = attackWithStableFlight(currentTarget, offsetBelow)
-            if success and dist then
+            adjustPosition(currentTarget, offsetBelow)
+            attackMob(currentTarget)
+            
+            local mobPos = getSafePosition(currentTarget)
+            local char = Player.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if mobPos and hrp then
+                local dist = (mobPos - hrp.Position).Magnitude
                 statusLabel.Text = "Бью: " .. mobType .. " (" .. string.format("%.1f", dist) .. ")"
             end
         end
@@ -487,7 +500,7 @@ end
 -- ==================== ФАРМ DEFEAT THE ====================
 local function farmDefeatTheQuest(questData)
     local mobType = questData.mob
-    local offsetBelow = 1 -- УМЕНЬШЕНО
+    local offsetBelow = 1
     
     statusLabel.Text = "Фарм: Defeat The " .. mobType
     questInfo.Text = "Квест: " .. questData.rawText
@@ -498,15 +511,17 @@ local function farmDefeatTheQuest(questData)
     while autoFarmEnabled do
         task.wait(0.016)
         
-        if not currentTarget or not currentTarget.Parent then
-            currentTarget = nil
-        else
-            local hum = currentTarget:FindFirstChildOfClass("Humanoid")
-            if not hum then hum = currentTarget:FindFirstChild("Humanoid") end
-            if not hum or hum.Health <= 0 then
-                statusLabel.Text = "Цель убита!"
-                task.wait(1)
-                return true
+        if currentTarget then
+            if not currentTarget.Parent then
+                currentTarget = nil
+            else
+                local hum = currentTarget:FindFirstChildOfClass("Humanoid")
+                if not hum then hum = currentTarget:FindFirstChild("Humanoid") end
+                if not hum or hum.Health <= 0 then
+                    statusLabel.Text = "Цель убита!"
+                    task.wait(1)
+                    return true
+                end
             end
         end
         
@@ -514,29 +529,19 @@ local function farmDefeatTheQuest(questData)
             local mobs = findMobs(mobType)
             if #mobs == 0 then
                 statusLabel.Text = "Поиск: The " .. mobType
-                task.wait(0.5)
+                task.wait(0.3)
                 continue
             end
             
             currentTarget = mobs[1]
-            statusLabel.Text = "Лечу к: The " .. mobType
+            statusLabel.Text = "ТЕЛЕПОРТ к: The " .. mobType
             
-            local char = Player.Character
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            local mobPos = getPosition(currentTarget)
-            if hrp and mobPos then
-                local dist = (hrp.Position - mobPos).Magnitude
-                if dist > 30 then
-                    teleportTo(mobPos - Vector3.new(0, offsetBelow, 0))
-                end
-            end
+            teleportToMob(currentTarget, offsetBelow)
         end
         
         if currentTarget then
-            local success, dist = attackWithStableFlight(currentTarget, offsetBelow)
-            if success and dist then
-                statusLabel.Text = "Бью The " .. mobType .. " (" .. string.format("%.1f", dist) .. ")"
-            end
+            adjustPosition(currentTarget, offsetBelow)
+            attackMob(currentTarget)
         end
     end
     
@@ -615,7 +620,7 @@ local function autoFarmLoop()
             task.wait(1.5)
         end
     end
-
+    
     statusLabel.Text = "Автофарм остановлен"
     questInfo.Text = "Квест: -"
     progressInfo.Text = "Прогресс: -"
@@ -637,8 +642,8 @@ end)
 
 btnESP.MouseButton1Click:Connect(function()
     espEnabled = not espEnabled
-
-        if espEnabled then
+    
+    if espEnabled then
         btnESP.Text = "ESP: ON"
         btnESP.BackgroundColor3 = Color3.fromRGB(50, 150, 50)
         
@@ -676,4 +681,4 @@ UIS.InputBegan:Connect(function(input, gameProcessed)
     end
 end)
 
-print("✅ Скрипт загружен!")
+print("✅ Скрипт загружен! Телепорт + плавный полёт")
